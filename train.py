@@ -94,7 +94,7 @@ if __name__ == "__main__":
                 run_folder = f"./logs/run_{run_idx}_r{lora.r}_lr{lr}_bs{bs}"
                 
                 config = RFModelConfig(
-                    model_name="meta-llama/Llama-3.2-1B-Instruct",
+                    model_name="Qwen/Qwen2.5-1.5B-Instruct",
                     peft_config=lora,
                     training_args=RFSFTConfig(
                         learning_rate=lr,

@@ -40,7 +40,10 @@ def load_schema_case_maps(schemas_dir, db_id):
     return table_case_map, column_case_map, "\n".join(schema_lines)
 
 def post_process_json(raw_text, table_case_map, column_case_map):
-    """Cleans up markdown artifacts and applies case matching against ground truth schemas."""
+    """Cleans up markdown artifacts and applies case matching against ground truth schemas.
+    
+    Includes defensive structural flattening for unpredictable zero-shot LLM anomalies.
+    """
     text = raw_text.strip()
     if text.startswith("```json"):
         text = text[7:]
@@ -59,23 +62,40 @@ def post_process_json(raw_text, table_case_map, column_case_map):
         
     sanitized = {}
     for raw_table, raw_cols in parsed.items():
+        # Safeguard if the key itself isn't a string
+        if not isinstance(raw_table, str):
+            continue
+            
         table_lc = raw_table.lower()
         if table_lc in table_case_map:
             true_table = table_case_map[table_lc]
             sanitized[true_table] = []
             
+            # Ensure the values are an iterable structure
             if isinstance(raw_cols, list):
-                for col in raw_cols:
-                    col_lc = col.lower()
-                    if col_lc in column_case_map[true_table]:
-                        sanitized[true_table].append(column_case_map[true_table][col_lc])
+                for item in raw_cols:
+                    # Defensive step: if the model wrapped columns in a nested list, flatten it
+                    if isinstance(item, list):
+                        sub_items = item
+                    else:
+                        sub_items = [item]
+                        
+                    for col in sub_items:
+                        if isinstance(col, str):
+                            col_lc = col.lower()
+                            if col_lc in column_case_map[true_table]:
+                                true_col = column_case_map[true_table][col_lc]
+                                # Keep values unique
+                                if true_col not in sanitized[true_table]:
+                                    sanitized[true_table].append(true_col)
     return sanitized
+
 
 def predict_schema_links(question, db_id, schemas_dir):
     """Loads the model once and processes streaming generations per instance entry."""
     global MODEL_LOADED, model_pipeline, tokenizer_instance
     
-    base_model_path = "meta-llama/Llama-3.2-1B-Instruct"
+    base_model_path = "Qwen/Qwen2.5-1.5B-Instruct"
     adapter_path = "./adapter"  # Points to your best-performing checkpoint directory
     
     if not MODEL_LOADED:
@@ -125,10 +145,10 @@ def predict_schema_links(question, db_id, schemas_dir):
         outputs = model_pipeline.generate(
             input_ids,
             max_new_tokens=128,
-            temperature=0.1,
-            do_sample=False,
+            do_sample=False,  # Greedy decoding for exact structural results
             pad_token_id=tokenizer_instance.pad_token_id,
             eos_token_id=tokenizer_instance.eos_token_id
+            # Removed temperature here to resolve the generation flags warning
         )
         
     generated_tokens = outputs[0][len(input_ids[0]):]
