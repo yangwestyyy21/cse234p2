@@ -1,36 +1,32 @@
 # train.py
 import os
 import json
+import torch
 from datasets import Dataset
 from rapidfireai import Experiment
 from rapidfireai.automl import List, RFGridSearch, RFModelConfig, RFLoraConfig, RFSFTConfig
-from transformers import AutoModelForCausalLM, AutoTokenizer
 
-# 1. Schema Serialization Utility
-def serialize_schema(db_id: str) -> str:
-    """Reads a Spider schema file and converts it into a lean string representation."""
-    # Resolve the space-to-underscore mapping mentioned in the spec
-    schema_filename = db_id.replace(" ", "_") + ".json"
-    schema_path = os.path.join("./schemas", schema_filename)
-    
-    if not os.path.exists(schema_path):
+def load_schema(schemas_dir, db_id):
+    """Loads a Spider/SNAILS schema JSON into a text summary for the context window."""
+    fname = db_id.replace(' ', '_').replace('/', '_') + '.json'
+    path = os.path.join(schemas_dir, fname)
+    if not os.path.exists(path):
         return ""
-        
-    with open(schema_path, "r") as f:
-        schema_data = json.load(f)
-        
-    serialized = []
-    # Build a concise representation to save context window tokens
-    for table in schema_data.get("table_names_original", []):
-        cols = [c[1] for c in schema_data.get("column_names_original", []) if c[0] == schema_data["table_names_original"].index(table)]
-        serialized.append(f"Table: {table} | Columns: [{', '.join(cols)}]")
-        
-    return "\n".join(serialized)
+    with open(path) as f:
+        s = json.load(f)
+    table_names = s['table_names_original']
+    column_names = s['column_names_original']
+    
+    schema_lines = []
+    for tidx, table_name in enumerate(table_names):
+        cols = [cname for t_idx, cname in column_names if t_idx == tidx]
+        schema_lines.append(f"Table: {table_name} | Columns: [{', '.join(cols)}]")
+    return "\n".join(schema_lines)
 
-# 2. Data Formatting Function for Llama Architecture
-def llama_formatting_function(row):
-    """Formats each data instance to match the Llama-3 instruction token space."""
-    serialized_db = serialize_schema(row["db_id"])
+def schema_linking_formatting_function(row):
+    """Formats raw instances into a Llama-3 instruction-matching prompt template."""
+    # Assuming schemas are stored in a standard local directory
+    serialized_db = load_schema("./schemas", row["db_id"])
     
     system_prompt = (
         "You are a strict database parsing utility. Given a database schema and a user question, "
@@ -39,91 +35,100 @@ def llama_formatting_function(row):
     )
     user_content = f"Database Schema:\n{serialized_db}\n\nUser Question: {row['question']}"
     
-    # Target training output contract
-    completion_content = json.dumps(row["schema_links"])
-    
     return {
         "prompt": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_content}
         ],
         "completion": [
-            {"role": "assistant", "content": completion_content}
+            {"role": "assistant", "content": json.dumps(row["schema_links"])}
         ]
     }
 
-# 3. Model Creation Function for RapidFire AI Interface
-def create_llama_model(model_config):
-    """Loads and configures base model and tokenizer pairs for the engine."""
+def create_model_and_tokenizer(model_config): 
+    """Factory builder for base models and tokenizers."""
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
     model_name = model_config["model_name"]
     model_kwargs = model_config["model_kwargs"]
-    
+ 
     model = AutoModelForCausalLM.from_pretrained(model_name, **model_kwargs)
     tokenizer = AutoTokenizer.from_pretrained(model_name)
-    
-    # Llama requires explicit pad token assignment if it's missing
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
-        
-    return model, tokenizer
+    return (model, tokenizer)
 
 if __name__ == "__main__":
-    # Initialize the tracking experiment instance
-    experiment = Experiment(experiment_name="llama-schema-linking", mode="fit")
+    # Ensure root log storage directory exists
+    os.makedirs("./logs", exist_ok=True)
+
+    # Initialize experiment framework pointing metadata summaries to ./logs
+    experiment = Experiment(
+        experiment_name="schema-linking-sft", 
+        mode="fit", 
+        experiments_path="./logs"
+    )
     
-    # Load your training files
+    # Load dataset splits
     with open("train.json", "r") as f:
-        train_data = json.load(f)
+        train_dataset = Dataset.from_list(json.load(f))
     with open("validation.json", "r") as f:
-        val_data = json.load(f)
-        
-    train_dataset = Dataset.from_list(train_data)
-    eval_dataset = Dataset.from_list(val_data)
+        eval_dataset = Dataset.from_list(json.load(f))
     
-    # 4. Programmatic Generation of 8 Distinct Configurations
-    # We sweep across 2 LoRA ranks, 2 learning rates, and 2 batch configurations
-    lora_variants = [
-        RFLoraConfig(r=16, lora_alpha=32, target_modules=["q_proj", "v_proj", "gate_proj", "up_proj", "down_proj"], bias="none"),
-        RFLoraConfig(r=32, lora_alpha=64, target_modules=["q_proj", "v_proj", "gate_proj", "up_proj", "down_proj"], bias="none")
+    # Define variations to generate 8 unique configurations
+    lora_options = [
+        RFLoraConfig(r=8, lora_alpha=16, target_modules=["q_proj", "v_proj"], bias="none"),
+        RFLoraConfig(r=16, lora_alpha=32, target_modules=["q_proj", "v_proj", "k_proj", "o_proj"], bias="none")
     ]
-    lr_variants = [1e-4, 2e-4]
-    batch_variants = [2, 4]
+    learning_rates = [5e-5, 1e-4]
+    batch_sizes = [2, 4]
     
-    configs_list = []
-    run_counter = 0
+    explicit_configs = []
+    run_idx = 0
     
-    for lora in lora_variants:
-        for lr in lr_variants:
-            for bs in batch_variants:
-                # Isolate outputs & logs to unique, run-specific folders under ./logs
-                run_dir = f"./logs/run_{run_counter}_r{lora.r}_lr{lr}_bs{bs}"
+    # Programmatically build combinations to enforce separate log folders
+    for lora in lora_options:
+        for lr in learning_rates:
+            for bs in batch_sizes:
+                # Isolate target run directories explicitly inside ./logs
+                run_folder = f"./logs/run_{run_idx}_r{lora.r}_lr{lr}_bs{bs}"
                 
-                model_config = RFModelConfig(
+                config = RFModelConfig(
                     model_name="meta-llama/Llama-3.2-1B-Instruct",
                     peft_config=lora,
                     training_args=RFSFTConfig(
                         learning_rate=lr,
                         per_device_train_batch_size=bs,
-                        per_device_eval_batch_size=bs,
-                        max_steps=200,
+                        per_device_eval_batch_size=2,
+                        max_steps=150,
                         logging_steps=10,
                         eval_strategy="steps",
                         eval_steps=50,
                         bf16=True,
-                        # --- ENSURE LOG ROUTING ---
-                        output_dir=f"{run_dir}/checkpoints",
-                        logging_dir=f"{run_dir}/tb_logs",
+                        # --- ENSURE SEPARATE LOG TRACKING HERE ---
+                        output_dir=f"{run_folder}/checkpoints",
+                        logging_dir=f"{run_folder}/tb_logs",
                         report_to=["tensorboard"]
                     ),
                     model_type="causal_lm",
-                    model_kwargs={"device_map": "auto", "torch_dtype": "auto", "use_cache": False},
-                    formatting_func=llama_formatting_function,
-                    generation_config={"max_new_tokens": 256, "temperature": 0.1, "top_p": 0.9}
+                    model_kwargs={"device_map": "auto", "torch_dtype": torch.bfloat16, "use_cache": False},
+                    formatting_func=schema_linking_formatting_function,
+                    generation_config={"max_new_tokens": 128, "temperature": 0.1, "top_p": 0.9}
                 )
-                configs_list.append(model_config)
-                run_counter += 1
+                explicit_configs.append(config)
+                run_idx += 1
                 
-    # Launch parallel/chunked grid search execution
-    config_group = RFGridSearch(configs=List(configs_list), trainer_type="SFT")
-    experiment.run_fit(config_group, create_llama_model, train_dataset, eval_dataset, num_chunks=4, seed=42)
+    # Pass the isolated list group into the auto-ml engine
+    config_group = RFGridSearch(configs=List(explicit_configs), trainer_type="SFT")
+    
+    print(f"Starting execution sweep across {len(explicit_configs)} isolated configurations...")
+    experiment.run_fit(
+        config_group=config_group,
+        model_create_fn=create_model_and_tokenizer,
+        train_dataset=train_dataset,
+        eval_dataset=eval_dataset,
+        num_chunks=4,
+        seed=42
+    )
     experiment.end()
+    print("Sweep complete. Run histories are fully tracked under unique subfolders in ./logs/")

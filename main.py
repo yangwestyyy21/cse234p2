@@ -1,185 +1,159 @@
 # main.py
+import argparse
+import json
 import os
 import re
-import json
-import argparse
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from peft import PeftModel
 
-def parse_args():
-    parser = argparse.ArgumentParser(description="SLM Schema Linking Inference Entrypoint")
-    parser.add_argument("--input", required=True, help="Path to input JSON file containing evaluation questions")
-    parser.add_argument("--output", required=True, help="Path to write final schema link target predictions")
-    return parser.parse_args()
+# Global cache pointers to prevent loading the model repeatedly in the loop
+MODEL_LOADED = False
+model_pipeline = None
+tokenizer_instance = None
 
-def load_schema_map(db_id: str):
-    """Loads structural ground-truth definitions to protect validation metrics."""
-    schema_filename = db_id.replace(" ", "_") + ".json"
-    schema_path = os.path.join("./schemas", schema_filename)
-    if not os.path.exists(schema_path):
-        return {}, {}
+def load_schema_case_maps(schemas_dir, db_id):
+    """Loads schema files to build mapping rules for case correction and verification."""
+    fname = db_id.replace(' ', '_').replace('/', '_') + '.json'
+    path = os.path.join(schemas_dir, fname)
+    if not os.path.exists(path):
+        return {}, {}, ""
         
-    with open(schema_path, "r") as f:
-        data = json.load(f)
+    with open(path) as f:
+        s = json.load(f)
         
-    tables = data.get("table_names_original", [])
-    columns = data.get("column_names_original", [])
+    table_names = s['table_names_original']
+    column_names = s['column_names_original']
     
-    # Map lowercase structures to their native casing counterparts to enable clean downstream repairs
-    table_case_map = {t.lower(): t for t in tables}
-    table_column_map = {t: [] for t in tables}
+    table_case_map = {t.lower(): t for t in table_names}
+    column_case_map = {t: {} for t in table_names}
     
-    for col_idx, (t_idx, col_name) in enumerate(columns):
-        if t_idx == -1: # Skip global wildcards
-            continue
-        parent_table = tables[t_idx]
-        table_column_map[parent_table].append(col_name)
+    schema_lines = []
+    for tidx, table_name in enumerate(table_names):
+        cols = []
+        for t_idx, cname in column_names:
+            if t_idx == tidx:
+                cols.append(cname)
+                column_case_map[table_name][cname.lower()] = cname
+        schema_lines.append(f"Table: {table_name} | Columns: [{', '.join(cols)}]")
         
-    return table_case_map, table_column_map
+    return table_case_map, column_case_map, "\n".join(schema_lines)
 
-def clean_and_parse_json(raw_string: str, table_case_map, table_column_map):
-    """Executes robust defensive processing loops against structured model outputs."""
-    # 1. Clear out markdown code block text formatting if appended by the model
-    raw_string = raw_string.strip()
-    if raw_string.startswith("```json"):
-        raw_string = raw_string[7:]
-    if raw_string.endswith("```"):
-        raw_string = raw_string[:-3]
-    raw_string = raw_string.strip()
+def post_process_json(raw_text, table_case_map, column_case_map):
+    """Cleans up markdown artifacts and applies case matching against ground truth schemas."""
+    text = raw_text.strip()
+    if text.startswith("```json"):
+        text = text[7:]
+    if text.endswith("```"):
+        text = text[:-3]
+    text = text.strip()
     
-    # 2. Extract JSON payload via regex if conversational filler was generated
-    if not (raw_string.startswith("{") and raw_string.endswith("}")):
-        match = re.search(r"\{.*\}", raw_string, re.DOTALL)
-        if match:
-            raw_string = match.group(0)
-            
+    if not (text.startswith("{") and text.endswith("}")):
+        match = re.search(r"\{.*\}", text, re.DOTALL)
+        text = match.group(0) if match else "{}"
+        
     try:
-        parsed_dict = json.loads(raw_string)
+        parsed = json.loads(text)
     except Exception:
-        # Emergency recovery fallback: Emit an empty schema structure to avoid dropping structural evaluation steps
         return {}
         
-    sanitized_output = {}
+    sanitized = {}
+    for raw_table, raw_cols in parsed.items():
+        table_lc = raw_table.lower()
+        if table_lc in table_case_map:
+            true_table = table_case_map[table_lc]
+            sanitized[true_table] = []
+            
+            if isinstance(raw_cols, list):
+                for col in raw_cols:
+                    col_lc = col.lower()
+                    if col_lc in column_case_map[true_table]:
+                        sanitized[true_table].append(column_case_map[true_table][col_lc])
+    return sanitized
+
+def predict_schema_links(question, db_id, schemas_dir):
+    """Loads the model once and processes streaming generations per instance entry."""
+    global MODEL_LOADED, model_pipeline, tokenizer_instance
     
-    # 3. Validation Filtering Loop Against Genuine Database Ground Truth
-    for predicted_table, predicted_cols in parsed_dict.items():
-        pred_table_lower = predicted_table.lower()
+    base_model_path = "meta-llama/Llama-3.2-1B-Instruct"
+    adapter_path = "./adapter"  # Points to your best-performing checkpoint directory
+    
+    if not MODEL_LOADED:
+        print("Initializing production fine-tuned SLM engine...")
+        tokenizer_instance = AutoTokenizer.from_pretrained(base_model_path)
+        if tokenizer_instance.pad_token is None:
+            tokenizer_instance.pad_token = tokenizer_instance.eos_token
+            
+        base_model = AutoModelForCausalLM.from_pretrained(
+            base_model_path,
+            device_map="auto",
+            torch_dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+        )
         
-        # Eliminate hallucinated table mappings to protect metric precision
-        if pred_table_lower in table_case_map:
-            true_table_name = table_case_map[pred_table_lower]
+        if os.path.exists(adapter_path):
+            print(f"Injecting fine-tuned weights from {adapter_path}...")
+            model_pipeline = PeftModel.from_pretrained(base_model, adapter_path)
+        else:
+            print("Warning: Missing adapter checkpoint. Operating in zero-shot fallback mode.")
+            model_pipeline = base_model
             
-            # Enforce structural consistency rules regarding column listings
-            if not isinstance(predicted_cols, list):
-                predicted_cols = []
-                
-            valid_columns = []
-            true_columns_lower = [c.lower() for c in table_column_map[true_table_name]]
-            column_case_map = {c.lower(): c for c in table_column_map[true_table_name]}
-            
-            for col in predicted_cols:
-                if col.lower() in true_columns_lower:
-                    # Enforce identifier casing matching the schema files
-                    valid_columns.append(column_case_map[col.lower()])
-                    
-            # Wildcard fallback condition: retain targeted elements without arbitrary columns as empty list []
-            sanitized_output[true_table_name] = valid_columns
-            
-    return sanitized_output
+        model_pipeline.eval()
+        MODEL_LOADED = True
+
+    # Build context structures
+    table_case_map, column_case_map, serialized_db = load_schema_case_maps(schemas_dir, db_id)
+    
+    system_prompt = (
+        "You are a strict database parsing utility. Given a database schema and a user question, "
+        "identify referenced tables and columns. Return ONLY a valid JSON object mapping "
+        "table names to lists of column names. Do not include conversational filler or markdown wrappers."
+    )
+    user_content = f"Database Schema:\n{serialized_db}\n\nUser Question: {question}"
+    
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_content}
+    ]
+    
+    input_ids = tokenizer_instance.apply_chat_template(
+        messages, 
+        add_generation_prompt=True, 
+        return_tensors="pt"
+    ).to(model_pipeline.device)
+    
+    with torch.no_grad():
+        outputs = model_pipeline.generate(
+            input_ids,
+            max_new_tokens=128,
+            temperature=0.1,
+            do_sample=False,
+            pad_token_id=tokenizer_instance.pad_token_id,
+            eos_token_id=tokenizer_instance.eos_token_id
+        )
+        
+    generated_tokens = outputs[0][len(input_ids[0]):]
+    raw_prediction = tokenizer_instance.decode(generated_tokens, skip_special_tokens=True)
+    
+    return post_process_json(raw_prediction, table_case_map, column_case_map)
 
 def main():
-    args = parse_args()
-    
-    # Core Model Pipeline Assembly Block
-    base_model_name = "meta-llama/Llama-3.2-1B-Instruct"
-    tokenizer = AutoTokenizer.from_pretrained(base_model_name)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-        
-    print("Initializing Base Language Model...")
-    base_model = AutoModelForCausalLM.from_pretrained(
-        base_model_name,
-        device_map="auto",
-        torch_dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
-    )
-    
-    # Load the fine-tuned LoRA weights safely from the repository root folder
-    adapter_path = "./adapter"
-    if os.path.exists(adapter_path):
-        print(f"Injecting Fine-Tuned PEFT Adapter from {adapter_path}...")
-        model = PeftModel.from_pretrained(base_model, adapter_path)
-    else:
-        print("Warning: No adapter folder located at root. Defaulting to zero-shot base evaluation.")
-        model = base_model
-        
-    model.eval()
-    
-    # Load Input Evaluation Evaluation File Contexts
-    with open(args.input, "r") as f:
-        input_data = json.load(f)
-        
-    output_records = []
-    
-    # Schema Generation Inference Loop
-    with torch.no_grad():
-        for record in input_data:
-            q_id = record["question_id"]
-            db_id = record["db_id"]
-            question = record["question"]
-            
-            # Dynamically parse current structural blueprint metrics
-            table_case_map, table_column_map = load_schema_map(db_id)
-            
-            # Reconstruct identical prompt context bounds used throughout SFT training execution
-            serialized_db = ""
-            schema_filename = db_id.replace(" ", "_") + ".json"
-            schema_path = os.path.join("./schemas", schema_filename)
-            if os.path.exists(schema_path):
-                with open(schema_path, "r") as sf:
-                    s_data = json.load(sf)
-                tables = s_data.get("table_names_original", [])
-                cols_raw = s_data.get("column_names_original", [])
-                s_lines = []
-                for t in tables:
-                    c_list = [c[1] for c in cols_raw if c[0] == tables.index(t)]
-                    s_lines.append(f"Table: {t} | Columns: [{', '.join(c_list)}]")
-                serialized_db = "\n".join(s_lines)
-                
-            messages = [
-                {"role": "system", "content": "You are a strict database parsing utility. Given a database schema and a user question, identify referenced tables and columns. Return ONLY a valid JSON object mapping table names to lists of column names. Do not include conversational filler or markdown wrappers."},
-                {"role": "user", "content": f"Database Schema:\n{serialized_db}\n\nUser Question: {question}"}
-            ]
-            
-            # Apply chat template encoding structures explicitly
-            input_ids = tokenizer.apply_chat_template(messages, add_generation_prompt=True, return_tensors="pt").to(model.device)
-            
-            outputs = model.generate(
-                input_ids,
-                max_new_tokens=256,
-                temperature=0.1,
-                do_sample=False,
-                eos_token_id=tokenizer.eos_token_id,
-                pad_token_id=tokenizer.pad_token_id
-            )
-            
-            # Strip prompt sequence context lengths from generation bounds
-            generated_tokens = outputs[0][len(input_ids[0]):]
-            raw_prediction = tokenizer.decode(generated_tokens, skip_special_tokens=True)
-            
-            # Execute validation safety nets on generated text output
-            sanitized_links = clean_and_parse_json(raw_prediction, table_case_map, table_column_map)
-            
-            # Construct submission record element mapping strictly back to specifications
-            output_records.append({
-                "question_id": q_id,
-                "schema_links": sanitized_links
-            })
-            
-    # Serialize output array back to the filesystem target path
-    with open(args.output, "w") as f:
-        json.dump(output_records, f, indent=2)
-    print(f"Successfully processed inference dataset. Results saved to {args.output}")
+    ap = argparse.ArgumentParser()
+    ap.add_argument('--input',   required=True)
+    ap.add_argument('--output',  required=True)
+    ap.add_argument('--schemas_dir', default='./schemas')
+    args = ap.parse_args()
 
-if __name__ == "__main__":
+    with open(args.input) as f:
+        items = json.load(f)
+        
+    preds = []
+    for it in items:
+        links = predict_schema_links(it['question'], it['db_id'], args.schemas_dir)
+        preds.append({'question_id': it['question_id'], 'schema_links': links})
+        
+    with open(args.output, 'w') as f:
+        json.dump(preds, f, indent=2)
+    print(f"Wrote {len(preds)} predictions to {args.output}")
+
+if __name__ == '__main__':
     main()
