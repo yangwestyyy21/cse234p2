@@ -95,8 +95,9 @@ def predict_schema_links(question, db_id, schemas_dir):
     """Loads the model once and processes streaming generations per instance entry."""
     global MODEL_LOADED, model_pipeline, tokenizer_instance
     
-    base_model_path = "Qwen/Qwen2.5-1.5B-Instruct"
-    adapter_path = "./adapter"  # Points to your best-performing checkpoint directory
+    base_model_path = "Qwen/Qwen2.5-0.5B-Instruct"
+    #TODO CHANGE EVERT TIME TO CONFIG WHICH MODEL
+    adapter_path = "/home/wbyang/cse234p2/experiments/5-31-1239/schema-linking-sft_22/runs/4/checkpoints/final_checkpoint"  # Points to your best-performing checkpoint directory
     
     if not MODEL_LOADED:
         print("Initializing production fine-tuned SLM engine...")
@@ -148,7 +149,6 @@ def predict_schema_links(question, db_id, schemas_dir):
             do_sample=False,  # Greedy decoding for exact structural results
             pad_token_id=tokenizer_instance.pad_token_id,
             eos_token_id=tokenizer_instance.eos_token_id
-            # Removed temperature here to resolve the generation flags warning
         )
         
     generated_tokens = outputs[0][len(input_ids[0]):]
